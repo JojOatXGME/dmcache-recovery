@@ -98,7 +98,7 @@ def verify(args):
 
 def emulate(args):
     name = args.emulate
-    with Popen("dmsetup", "create", "-r", name, stdin=PIPE, text=True) as p:
+    with Popen(["dmsetup", "create", "-r", name], stdin=PIPE, text=True) as p:
         for line in generate_table(args):
             p.stdin.write(line)
             p.stdin.write("\n")
@@ -113,19 +113,26 @@ def print_table(args):
         print(line)
 
 
+def is_effectively_dirty(entry, fd_origin, fd_cache):
+    origin_bytes = dev_read_block(fd_origin, entry.origin_block, entry.block_bytes)
+    cache_bytes = dev_read_block(fd_cache, entry.cache_block, entry.block_bytes)
+    return origin_bytes != cache_bytes
+
+
 def generate_table(args):
     cache_device = args.cache
     origin_device = args.origin
     device_size = get_device_size(origin_device)
 
-    heap = []
-    def callback(entry):
-        if entry.origin_sector + entry.block_sectors > device_size:
-            sys.exit(f"block out of range: {entry.origin_sector}; device size: {device_size}")
-        if args.all or entry.dirty:
-            heapq.heappush(heap, (entry.origin_block, entry))
+    with dev_open(cache_device) as fd_cache, dev_open(origin_device) as fd_origin:
+        heap = []
+        def callback(entry):
+            if entry.origin_sector + entry.block_sectors > device_size:
+                sys.exit(f"block out of range: {entry.origin_sector}; device size: {device_size}")
+            if args.all and is_effectively_dirty(entry, fd_origin, fd_cache) or entry.dirty:
+                heapq.heappush(heap, (entry.origin_block, entry))
 
-    read_metadata(args, callback)
+        read_metadata(args, callback)
 
     next_sector = 0
     while heap:
@@ -136,7 +143,7 @@ def generate_table(args):
             count = current_offset - next_sector
             yield f"{next_sector} {count} linear {origin_device} {next_sector}"
         yield f"{current_offset} {block_size} linear {cache_device} {current_entry.cache_sector}"
-        next_sector = current_offset + 1
+        next_sector = current_offset + block_size
     if next_sector < device_size:
         count = device_size - next_sector
         yield f"{next_sector} {count} linear {origin_device} {next_sector}"
@@ -160,7 +167,7 @@ def writeback(args):
     with dev_open(args.cache) as fd_cache, dev_open(args.origin, write=True) as fd_origin:
         def callback(entry):
             if args.all or entry.dirty:
-                print(f"{entry.cache_block} -> {entry.origin_block} (dirty={entry.dirty})", file=sys.stderr)
+                #print(f"{entry.cache_block} -> {entry.origin_block} (dirty={entry.dirty})", file=sys.stderr)
                 dev_copy_block(fd_cache, entry.cache_block, fd_origin, entry.origin_block, entry.block_bytes)
         read_metadata(args, callback)
 
