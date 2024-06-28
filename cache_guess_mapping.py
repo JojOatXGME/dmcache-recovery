@@ -25,15 +25,12 @@ def main():
     subparser.add_argument("device")
     subparser.set_defaults(func=collect)
 
-    subparser = subparsers.add_parser("sort")
-    subparser.add_argument("index")
-    subparser.set_defaults(func=sort)
-
-    subparser = subparsers.add_parser("lookup")
+    subparser = subparsers.add_parser("find")
     subparser.add_argument("index")
     subparser.add_argument("cache_device")
-    subparser.add_argument("block", required=False)
-    subparser.set_defaults(func=lookup)
+    #subparser.add_argument("block", required=False)
+    subparser.add_argument("--cache-block-size", type=int, default=512, help="In sectors (512 bytes)")
+    subparser.set_defaults(func=find)
 
     args = argparser.parse_args()
     args.func(args)
@@ -52,11 +49,7 @@ def collect(args):
                 if offset % (BLOCK_SIZE * 10240) == 0:
                     log_status(offset, device_size, "bytes")
 
-                block = device[offset:offset + BLOCK_SIZE]
-                #assert len(block) == BLOCK_SIZE, f"len(block): {len(block)}; BLOCK_SIZE: {BLOCK_SIZE}"
-                m = hashlib.sha1(usedforsecurity=False)
-                m.update(block)
-                digest = m.digest()
+                digest = hash_block(device, offset, BLOCK_SIZE)
                 assert len(digest) <= HASH_BYTES, f"len(digest): {len(digest)}; HASH_BYTES: {HASH_BYTES}"
                 index_offset = index_block * BLOCK_SIZE + index_entry * ENTRY_SIZE
                 index_file[index_offset:index_offset + ENTRY_SIZE] = struct.pack(STRUCT_FORMAT, digest, offset)
@@ -67,128 +60,68 @@ def collect(args):
             log_complete(device_size, "bytes")
 
 
-def sort(args):
-    with mmap_open(args.index, write=True) as mmap:
-        heap = Heap(mmap)
-        total_blocks = heap.block_count
-        def status_callback(sorted_blocks):
-            if sorted_blocks % 10 == 0:
-                log_status(sorted_blocks, total_blocks, "blocks")
-        heap.sort(status_callback):
-        log_complete(total_blocks, "blocks")
-
-
-def lookup(args):
+def find(args):
+    # Load index
+    index = {}
     with mmap_open(args.index) as mmap:
-        heap = Heap(mmap)
-        pass
+        device_size = device.size()
+        block_offset = 0
+        while block_offset < device_size:
+            if block_offset % (1024 * BLOCK_SIZE) == 0:
+                log_status(block_offset, device_size, "bytes")
+            for entry in range(ENTRIES_PER_BLOCK):
+                index_offset = block_offset + entry * ENTRY_SIZE
+                digest, offset = struct.unpack(STRUCT_FORMAT, mmap[index_offset:index_offset + ENTRY_SIZE])
+                if offset % BLOCK_SIZE != 0:
+                    sys.exit(f"Offset doesn't match fs block size: {offset}")
+                index.setdefault(digest, []).append(offset)
+            block_offset += BLOCK_SIZE
+        log_complete(device_size, "bytes")
+
+    # Read cache
+    with mmap_open(args.cache_device) as mmap:
+        cache_block_size = 512 * args.cache_block_size
+        cache_total_blocks = mmap.size() // cache_block_size
+        block_max_matches = cache_block_size // BLOCK_SIZE
+        for cache_block in range(cache_total_blocks):
+            log_status(cache_block, cache_total_blocks, "blocks", newline=True)
+            matches = {}
+            fake_matches = 0
+            for fs_block in range(block_max_matches):
+                digest = hash_block(mmap, cache_block * cache_block_size + fs_block * BLOCK_SIZE, BLOCK_SIZE)
+                for match in index.get(digest, []):
+                    origin_fs_block = match // BLOCK_SIZE
+                    origin_cache_block = match // cache_block_size
+                    origin_local_fs_block = origin_fs_block % block_max_matches
+                    if origin_local_fs_block != fs_block:
+                        fake_matches += 1
+                        continue
+                    matches.setdefault(origin_cache_block, 0)
+                    matches[origin_cache_block] += 1
+            first=True
+            for match in sorted(matches.items(), key=lambda t: t[1], reverse=True):
+                print(f"{'' if first else '#'}{cache_block} -> {match[0]} ({match[1] / block_max_matches:3%} match)")
+                first=False
+            if fake_matches != 0:
+                print(f"#{fake_matches} fake matches")
+        log_complete(cache_total_blocks, "blocks")
 
 
-def log_status(current, total, unit):
+def hash_block(mmap, offset, size):
+    block = mmap[offset:offset + size]
+    # assert len(block) == size, f"len(block): {len(block)}; size: {size}"
+    m = hashlib.sha1(usedforsecurity=False)
+    m.update(block)
+    return m.digest()
+
+
+def log_status(current, total, unit, *, newline=False):
     percentage = 100 * (current / total)
-    print(f"{percentage:5.1f} % - {current:,d} of {total:,d} {unit}\r", end="", file=sys.stderr)
+    print(f"{percentage:5.1f} % - {current:,d} of {total:,d} {unit}", end="\n" if newline else "\r", file=sys.stderr)
 
 
 def log_complete(total, unit):
     print(f"100.0 % - {total:,d} of {total:,d} {unit}\r", end="", file=sys.stderr)
-
-
-class Heap:
-
-    def __init__(self, mmap):
-        self.__mmap = mmap
-        self.__block_count = mmap.size() // BLOCK_SIZE
-        assert mmap.size() % BLOCK_SIZE == 0, f"mmap.size(): {mmap.size()}; BLOCK_SIZE: {BLOCK_SIZE}"
-
-    @property
-    def block_count(self):
-        return self.__block_count
-
-    def __length_hint__(self):
-        return ENTRIES_PER_BLOCK * self.__block_count
-
-    def __iter__(self):
-        return self.__iter()
-
-    def __iter(self, block_index=0):
-        if block_index >= self.__block_count:
-            return
-        for i in range(ENTRIES_PER_BLOCK):
-            yield from self.__iter(next_block(block_index, i))
-            yield self.__get(block_index, i)
-        yield from self.__iter(next_block(block_index, ENTRIES_PER_BLOCK))
-
-    def __iter_own(self, block_index):
-        assert block_index < self.__block_count, f"{block_index} < {self.__block_count}"
-        for i in range(ENTRIES_PER_BLOCK):
-            yield self.__get(block_index, i)
-
-    def __get(self, block_index, entry):
-        pass
-
-    def find(self, needle, block_index=0):
-        if block_index >= self.__block_count:
-            return
-        block_offset = block_index * BLOCK_SIZE
-        for i in range(ENTRIES_PER_BLOCK):
-            offset = block_offset + i * ENTRY_SIZE
-            key, value = struct.unpack_from(STRUCT_FORMAT, buffer=self.__mmap, offset=offset)
-            if key > needle:
-                return find(needle, next_block(block_index, i))
-            elif key == needle:
-                return value
-        return find(needle, next_block(block_index, ENTRIES_PER_BLOCK))
-
-    def sort(callback, block_index=0, start=0, end=ENTRIES_PER_BLOCK):
-        if block_index >= self.__block_count:
-            return 0
-        if start + 1 == end:
-            return 0
-
-        if start + 2 == end:
-            ls
-
-        # TODO Sort own
-        # TODO yield
-        # Sort all children
-        sorted_blocks = 1
-        for i in range(ENTRIES_PER_BLOCK + 1):
-            child = next_block(block_index, i)
-            sorted_blocks += self.sort(callback, child)
-        # Merge
-        for i in range(ENTRIES_PER_BLOCK):
-            right = [self.__iter(next_block(block_index, j + 1)) for j in range(i, ENTRIES_PER_BLOCK)]
-            smallest_it = chain_sorted(self.__iter_own(block_index), *right)
-            smallest = next(smallest_it)
-            for target in self.__iter(next_block(block_index, i)):
-                if smallest < target:
-                    self.__swap(target, smallest)
-                    smallest = next(smallest_it)
-            own = self.__get(block_index, i)
-            if smallest < own:
-                self.__swap(own, smallest)
-        # Report number of sorted blocks
-        callback(sorted_blocks)
-        return sorted_blocks
-
-    def __swap(entry1, entry2):
-        pass # TODO
-
-    def next_block(block_index, i):
-        return (ENTRIES_PER_BLOCK + 1) * block_index + i + 1
-
-
-#def chain_sorted(*iterables):
-#    min_heap = []
-#    for it in iterables:
-#        heapq.heappush(min_heap, (next(it), it))
-#    while min_heap:
-#        smallest = min_heap[0]
-#        yield smallest[0]
-#        try:
-#            heapq.heapreplace(min_heap, next(smallest[1]))
-#        except StopIteration:
-#            heapq.heappop(min_heap)
 
 
 @contextmanager
