@@ -1,0 +1,16 @@
+# See documentation at https://doc.rust-lang.org/cargo/reference/manifest.html
+[package]
+name = "dmcache-recovery"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "cache_guess_mapping"
+path = "src/cache_guess_mapping.rs"
+
+[dependencies]
+bincode = "1.3.3"
+clap = { version = "4.5.8", features = ["derive"] }
+memmap2 = "0.9.4"
+serde = { version = "1.0.203", features = ["derive"] }
+sha1 = "0.10.6"
