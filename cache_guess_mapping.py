@@ -63,15 +63,17 @@ def collect(args):
 def find(args):
     # Load index
     index = {}
-    with mmap_open(args.index) as mmap:
-        device_size = device.size()
+    with open(args.index, "rb") as fd:
+        device_size = os.path.getsize(args.index)
         block_offset = 0
         while block_offset < device_size:
+            block_bytes = fd.read(BLOCK_SIZE)
+            assert len(block_bytes) == BLOCK_SIZE
             if block_offset % (1024 * BLOCK_SIZE) == 0:
                 log_status(block_offset, device_size, "bytes")
             for entry in range(ENTRIES_PER_BLOCK):
-                index_offset = block_offset + entry * ENTRY_SIZE
-                digest, offset = struct.unpack(STRUCT_FORMAT, mmap[index_offset:index_offset + ENTRY_SIZE])
+                index_offset = entry * ENTRY_SIZE
+                digest, offset = struct.unpack_from(STRUCT_FORMAT, buffer=block_bytes, offset=index_offset)
                 if offset % BLOCK_SIZE != 0:
                     sys.exit(f"Offset doesn't match fs block size: {offset}")
                 index.setdefault(digest, []).append(offset)
